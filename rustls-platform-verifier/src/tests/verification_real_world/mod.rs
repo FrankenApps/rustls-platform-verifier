@@ -158,6 +158,19 @@ fn real_world_test<E: std::error::Error>(test_case: &TestCase<E>) {
     #[cfg(not(target_os = "freebsd"))]
     let verifier = Verifier::new(crypto_provider).unwrap();
 
+    real_world_test_with_verifier(test_case, &verifier);
+
+    #[cfg(target_os = "android")]
+    for roots in [vec![], vec![super::verification_mock::ROOT1]] {
+        let verifier = Verifier::new_with_extra_roots(roots, test_provider()).unwrap();
+        real_world_test_with_verifier(test_case, &verifier);
+    }
+}
+
+fn real_world_test_with_verifier<E: std::error::Error>(
+    test_case: &TestCase<E>,
+    verifier: &Verifier,
+) {
     let mut chain = test_case
         .chain
         .iter()

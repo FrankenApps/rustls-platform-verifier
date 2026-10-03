@@ -55,6 +55,10 @@ macro_rules! mock_root_test_cases {
 
         #[cfg(feature = "ffi-testing")]
         pub static ALL_TEST_CASES: &'static [fn()] = &[
+            #[cfg(target_os = "android")]
+            extra_roots_are_isolated,
+            #[cfg(target_os = "android")]
+            invalid_extra_roots,
             $(
                 #[cfg($target)]
                 $name,
@@ -68,7 +72,6 @@ macro_rules! mock_root_test_cases {
             #[cfg($target)]
             pub(super) fn $name() {
                 test_with_mock_root(&$test_case, Roots::OnlyExtra);
-                #[cfg(all($target, not(target_os = "android")))]
                 test_with_mock_root(&$test_case, Roots::ExtraAndPlatform);
             }
         )+
@@ -81,7 +84,7 @@ macro_rules! no_error {
     };
 }
 
-const ROOT1: pki_types::CertificateDer<'static> =
+pub(super) const ROOT1: pki_types::CertificateDer<'static> =
     pki_types::CertificateDer::from_slice(include_bytes!("root1.crt"));
 const ROOT1_INT1: &[u8] = include_bytes!("root1-int1.crt");
 const ROOT1_INT1_EXAMPLE_COM_GOOD: &[u8] = include_bytes!("root1-int1-ee_example.com-good.crt");
@@ -138,6 +141,71 @@ pub(super) fn verification_without_mock_root() {
 #[test]
 fn test_verification_without_mock_root() {
     verification_without_mock_root()
+}
+
+#[cfg(target_os = "android")]
+#[cfg_attr(test, test)]
+fn extra_roots_are_isolated() {
+    let unrelated_root = pki_types::CertificateDer::from_slice(include_bytes!(
+        "../verification_real_world/aws_amazon_com_valid_4.crt"
+    ));
+    // Multiple roots, including duplicates, must all be accepted.
+    let with_root =
+        Verifier::new_with_extra_roots([unrelated_root.clone(), ROOT1, ROOT1], test_provider())
+            .unwrap();
+    let without_root = Verifier::new(test_provider()).unwrap();
+    let empty_roots = Verifier::new_with_extra_roots([], test_provider()).unwrap();
+    let other_roots = Verifier::new_with_extra_roots([unrelated_root], test_provider()).unwrap();
+    let verify = |verifier: &Verifier| {
+        verifier
+            .verify_server_cert(
+                &pki_types::CertificateDer::from(ROOT1_INT1_EXAMPLE_COM_GOOD),
+                &[pki_types::CertificateDer::from(ROOT1_INT1)],
+                &pki_types::ServerName::try_from(EXAMPLE_COM).unwrap(),
+                &[],
+                verification_time(),
+            )
+            .map(|_| ())
+    };
+
+    // Interleave verifiers to ensure neither construction nor verification leaks roots.
+    for _ in 0..2 {
+        assert_eq!(verify(&with_root), Ok(()));
+        for verifier in [&without_root, &empty_roots, &other_roots] {
+            assert_eq!(
+                verify(verifier),
+                Err(TlsError::InvalidCertificate(
+                    CertificateError::UnknownIssuer
+                )),
+            );
+        }
+    }
+    drop(other_roots);
+    assert_eq!(verify(&with_root), Ok(()));
+    drop(with_root);
+    assert_eq!(
+        verify(&without_root),
+        Err(TlsError::InvalidCertificate(
+            CertificateError::UnknownIssuer
+        )),
+    );
+}
+
+#[cfg(target_os = "android")]
+#[cfg_attr(test, test)]
+fn invalid_extra_roots() {
+    for root in [&[][..], &[1, 2, 3], &ROOT1.as_ref()[..32]] {
+        let invalid_root = pki_types::CertificateDer::from(root.to_vec());
+        // A valid root must not hide a malformed root in the same input.
+        let result = Verifier::new_with_extra_roots([ROOT1, invalid_root], test_provider());
+        assert!(matches!(
+            result,
+            Err(TlsError::InvalidCertificate(CertificateError::BadEncoding)),
+        ));
+    }
+    // Malformed input must not leave a pending JNI exception or mutate shared trust state.
+    let _verifier = Verifier::new_with_extra_roots([ROOT1], test_provider()).unwrap();
+    verification_without_mock_root();
 }
 
 // Note: Android does not currently support IP address hosts, so these tests are disabled for
@@ -354,7 +422,6 @@ fn test_with_mock_root<E: std::error::Error + PartialEq + 'static>(
     let provider = test_provider();
     let verifier = match root_src {
         Roots::OnlyExtra => Verifier::new_with_fake_root(ROOT1, provider), // TODO: time
-        #[cfg(not(target_os = "android"))]
         Roots::ExtraAndPlatform => Verifier::new_with_extra_roots([ROOT1], provider).unwrap(),
     };
     let mut chain = test_case
@@ -395,9 +462,6 @@ enum Roots {
     /// We want to keep things reproducible given the background-managed nature of trust roots on platforms.
     OnlyExtra,
     /// Test with loading the extra roots and the platform trust store.
-    ///
-    /// Right now, not all platforms are supported.
-    #[cfg(not(target_os = "android"))]
     ExtraAndPlatform,
 }
 

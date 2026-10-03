@@ -1,6 +1,6 @@
 use jni::{
     jni_sig, jni_str,
-    objects::{JByteArray, JObject, JObjectArray, JString, JValue},
+    objects::{Global, JByteArray, JObject, JObjectArray, JString, JValue},
     signature::MethodSignature,
     Env,
 };
@@ -38,6 +38,8 @@ const AUTH_TYPE: &str = "RSA";
 /// A TLS certificate verifier that utilizes the Android platform verifier.
 #[derive(Debug)]
 pub struct Verifier {
+    /// A per-verifier trust manager and keystore for additional trust anchors.
+    extra_roots: Option<Global<JObject<'static>>>,
     /// Testing only: The root CA certificate to trust.
     #[cfg(any(test, feature = "ffi-testing"))]
     test_only_root_ca_override: Option<pki_types::CertificateDer<'static>>,
@@ -69,6 +71,60 @@ impl Verifier {
     #[cfg_attr(docsrs, doc(cfg(all())))]
     pub fn new(crypto_provider: Arc<CryptoProvider>) -> Result<Self, TlsError> {
         Ok(Self {
+            extra_roots: None,
+            #[cfg(any(test, feature = "ffi-testing"))]
+            test_only_root_ca_override: None,
+            crypto_provider,
+        })
+    }
+
+    /// Creates a new instance of a TLS certificate verifier that utilizes the Android
+    /// certificate facilities with the addition of extra root certificates to trust.
+    ///
+    /// The extra roots are scoped to this verifier and do not modify the system trust store.
+    /// The Android runtime must be initialized before calling this method with nonempty roots.
+    #[cfg_attr(docsrs, doc(cfg(all())))]
+    pub fn new_with_extra_roots(
+        roots: impl IntoIterator<Item = pki_types::CertificateDer<'static>>,
+        crypto_provider: Arc<CryptoProvider>,
+    ) -> Result<Self, TlsError> {
+        let roots: Vec<_> = roots.into_iter().collect();
+        if roots.is_empty() {
+            return Self::new(crypto_provider);
+        }
+
+        let extra_roots = with_context(|cx| {
+            let cert_verifier_class = CERT_VERIFIER_CLASS.get(cx)?;
+            let root_list =
+                JObjectArray::<JByteArray>::new(cx.env, roots.len(), &JByteArray::null())?;
+            for (idx, root) in roots.iter().enumerate() {
+                let root = cx.env.byte_array_from_slice(root)?;
+                root_list.set_element(cx.env, idx, root)?;
+            }
+
+            let extra_roots = cx
+                .env
+                .call_static_method(
+                    cert_verifier_class,
+                    jni_str!("createExtraRoots"),
+                    jni_sig!((byte[][]) -> org.rustls.platformverifier.ExtraRoots),
+                    &[JValue::from(&root_list)],
+                )?
+                .l()?;
+
+            if extra_roots.is_null() {
+                Ok(None)
+            } else {
+                Ok(Some(cx.env.new_global_ref(extra_roots)?))
+            }
+        })
+        .map_err(|e| {
+            TlsError::General(format!("failed to create extra root trust manager: {e:?}"))
+        })?
+        .ok_or(InvalidCertificate(CertificateError::BadEncoding))?;
+
+        Ok(Self {
+            extra_roots: Some(extra_roots),
             #[cfg(any(test, feature = "ffi-testing"))]
             test_only_root_ca_override: None,
             crypto_provider,
@@ -82,6 +138,7 @@ impl Verifier {
         crypto_provider: Arc<CryptoProvider>,
     ) -> Self {
         Self {
+            extra_roots: None,
             test_only_root_ca_override: Some(root),
             crypto_provider,
         }
@@ -168,7 +225,8 @@ impl Verifier {
                     JString[],
                     byte[],
                     jlong,
-                    byte[][]
+                    byte[][],
+                    org.rustls.platformverifier.ExtraRoots
                 ) -> org.rustls.platformverifier.VerificationResult
             );
 
@@ -178,6 +236,8 @@ impl Verifier {
 
             let server_name = cx.env.new_string(server_name)?;
             let auth_type = cx.env.new_string(AUTH_TYPE)?;
+            let no_extra_roots = JObject::null();
+            let extra_roots = self.extra_roots.as_deref().unwrap_or(&no_extra_roots);
 
             let result = cx
                 .env
@@ -193,6 +253,7 @@ impl Verifier {
                         JValue::from(&ocsp_response),
                         JValue::Long(now),
                         JValue::from(&JObject::from(cert_list)),
+                        JValue::from(extra_roots),
                     ],
                 )?
                 .l()?;

@@ -48,6 +48,12 @@ private class VerificationResult(
     private val code: Int = status.value
 }
 
+// Owned by a Rust Verifier through a JNI global reference, never shared with other verifiers.
+private class ExtraRoots(
+    val keystore: KeyStore,
+    val trustManager: X509TrustManagerExtensions,
+)
+
 // NOTE: All TrustManager and certificate validation methods are not thread safe. These
 // are all guarded by Kotlin's `Synchronized` accessors to prevent undefined behavior.
 
@@ -104,6 +110,7 @@ internal object CertificateVerifier {
         makeLazyTrustManager(mockKeystore)
 
     @JvmStatic
+    @Synchronized
     private fun addMockRoot(root: ByteArray) {
         if (!BuildConfig.TEST) {
             throw Exception("attempted to add a mock root outside a test!")
@@ -118,6 +125,7 @@ internal object CertificateVerifier {
     }
 
     @JvmStatic
+    @Synchronized
     private fun clearMockRoots() {
         // Reload to get a completely fresh internal state
         mockKeystore.load(null)
@@ -179,6 +187,29 @@ internal object CertificateVerifier {
         makeLazyTrustManager(systemKeystore)
 
     @JvmStatic
+    @Synchronized
+    private fun createExtraRoots(roots: Array<ByteArray>): ExtraRoots? {
+        val keystore = KeyStore.getInstance(KeyStore.getDefaultType())
+        keystore.load(null)
+        roots.forEachIndexed { index, root ->
+            val certificate = try {
+                certFactory.generateCertificate(ByteArrayInputStream(root))
+            } catch (_: CertificateException) {
+                // A null result tells Rust that a supplied root could not be decoded.
+                return null
+            }
+            keystore.setCertificateEntry("root_$index", certificate)
+        }
+
+        // Do not use makeLazyTrustManager here: loading the keystore again would clear its roots.
+        val trustManager = checkNotNull(createTrustManager(keystore)) {
+            "No trust manager available for extra roots"
+        }
+        return ExtraRoots(keystore, trustManager)
+    }
+
+    @JvmStatic
+    @Synchronized
     private fun verifyCertificateChain(
         @Suppress("UNUSED_PARAMETER") context: Context,
         serverName: String,
@@ -187,6 +218,7 @@ internal object CertificateVerifier {
         ocspResponse: ByteArray?,
         time: Long,
         certChain: Array<ByteArray>,
+        extraRoots: ExtraRoots?,
     ): VerificationResult {
         // Convert the array of (supposedly) DER bytes into certificates.
         val certificateChain = mutableListOf<X509Certificate>()
@@ -217,28 +249,28 @@ internal object CertificateVerifier {
             return VerificationResult(StatusCode.InvalidExtension)
         }
 
-        // Select the trust manager to use.
+        // Select the platform trust manager. Extra roots are tried separately below.
         //
         // We select them as follows:
-        // - If built for release, only use the system trust manager. This should let all test-related
+        // - If built for release, use the system trust manager. This should let all test-related
         // code be optimized out.
         // - If built for tests:
         //      - If the mock CA store has any values, use the mock trust manager.
         //      - Otherwise, use the system trust manager.
-        val (trustManager, keystore) = if (!BuildConfig.TEST) {
-            val trustManager =
-                systemTrustManager.value ?: return VerificationResult(StatusCode.Unavailable)
-            Pair(trustManager, systemKeystore)
+        val (trustManager, platformKeystore) = if (!BuildConfig.TEST) {
+            Pair(systemTrustManager.value, systemKeystore)
         } else {
             if (mockKeystore.size() != 0) {
                 val trustManager = mockTrustManager.value!!
                 Pair(trustManager, mockKeystore)
             } else {
-                val trustManager =
-                    systemTrustManager.value ?: return VerificationResult(StatusCode.Unavailable)
-                Pair(trustManager, systemKeystore)
+                Pair(systemTrustManager.value, systemKeystore)
             }
         }
+        if (trustManager == null && extraRoots == null) {
+            return VerificationResult(StatusCode.Unavailable)
+        }
+        var keystore = platformKeystore
 
         // Verify that the certificate chain is valid and correct, and nothing more.
         //
@@ -251,7 +283,17 @@ internal object CertificateVerifier {
         // Returns the "the properly ordered chain used for verification as a list of X509Certificates.",
         // meaning a list from end-entity certificate to trust-anchor.
         val validChain = try {
-            trustManager.checkServerTrusted(certificateChain.toTypedArray(), authMethod, serverName)
+            try {
+                trustManager?.checkServerTrusted(certificateChain.toTypedArray(), authMethod, serverName)
+                    ?: throw CertificateException("No system trust manager available")
+            } catch (e: CertificateException) {
+                if (extraRoots == null) {
+                    throw e
+                }
+                // Revocation checking must use the same trust anchors as chain validation.
+                keystore = extraRoots.keystore
+                extraRoots.trustManager.checkServerTrusted(certificateChain.toTypedArray(), authMethod, serverName)
+            }
         } catch (e: CertificateException) {
             // In test configurations we may see `checkServerTrusted` fail once vendored test
             // certificates pass their expiry date. We try to avoid that by using a fixed

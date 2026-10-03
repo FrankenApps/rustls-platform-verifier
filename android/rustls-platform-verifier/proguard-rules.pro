@@ -13,6 +13,7 @@
 # We need this function (and class) in all builds for Rust to call because its the JNI entrypoint
 # for the verifier functionality.
 -keep class org.rustls.platformverifier.CertificateVerifier {
+    createExtraRoots(byte[][]);
     verifyCertificateChain(
         android.content.Context,
         java.lang.String,
@@ -20,7 +21,8 @@
         java.lang.String[],
         byte[],
         long,
-        byte[][]
+        byte[][],
+        org.rustls.platformverifier.ExtraRoots
     );
 }
 
@@ -28,6 +30,7 @@
 # and access their fields at runtime.
 -keep class org.rustls.platformverifier.StatusCode { *; }
 -keep class org.rustls.platformverifier.VerificationResult { *; }
+-keep class org.rustls.platformverifier.ExtraRoots { *; }
 
 # Note: We don't explicitly tell Proguard to remove test-only methods. They are instead
 # removed as dead code because `javac` removes all references to them when not building

@@ -69,7 +69,7 @@ impl Verifier {
     /// facilities with the addition of extra root certificates to trust.
     ///
     /// See [Verifier::new] for the external requirements the verifier needs.
-    #[cfg_attr(docsrs, doc(cfg(not(target_os = "android"))))]
+    #[cfg_attr(docsrs, doc(cfg(all())))]
     pub fn new_with_extra_roots(
         roots: impl IntoIterator<Item = pki_types::CertificateDer<'static>>,
         crypto_provider: Arc<CryptoProvider>,
